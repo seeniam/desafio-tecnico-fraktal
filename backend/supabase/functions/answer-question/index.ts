@@ -19,8 +19,12 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-client-info",
 };
 
+function normalizeText(s: string) {
+  return s.replace(/\s+/g, " ").trim();
+}
+
 serve(async (req) => {
-  // ✅ Preflight (isso que está faltando)
+  // ✅ Preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -54,6 +58,7 @@ serve(async (req) => {
       apiKey: mustEnv("OPENAI_API_KEY", OPENAI_API_KEY),
     });
 
+    // 1) Embedding da pergunta
     const embeddingResponse = await openai.embeddings.create({
       model: "text-embedding-3-small",
       input: question,
@@ -62,6 +67,7 @@ serve(async (req) => {
     const queryEmbedding = embeddingResponse.data?.[0]?.embedding;
     if (!queryEmbedding) throw new Error("Failed to generate embedding for the question");
 
+    // 2) Busca semântica
     const { data: matches, error: matchError } = await supabase.rpc("match_documents", {
       query_embedding: queryEmbedding,
       match_count: topK,
@@ -79,21 +85,31 @@ serve(async (req) => {
       );
     }
 
-    const sources = matches.map((m: any, index: number) => ({
-      rank: index + 1,
-      id: m.id,
-      similarity: m.similarity,
-      content: m.content,
-    }));
+    // 3) Monta fontes com dados úteis pro frontend (sem UUID na resposta do modelo)
+    const sources = matches.map((m: any, index: number) => {
+      const raw = String(m.content ?? "");
+      const clean = normalizeText(raw);
 
+      const preview = clean.slice(0, 180);
+      const titleBase = clean.slice(0, 48);
+      const title = titleBase.length === 48 ? `${titleBase}…` : titleBase || `Nota ${index + 1}`;
+
+      return {
+        rank: index + 1,
+        id: m.id,
+        similarity: m.similarity,
+        title,
+        preview,
+        content: raw, // mantém para montar contexto (não precisa mandar pro frontend)
+      };
+    });
+
+    // 4) Contexto para o modelo: sem IDs, sem UUID, só fontes numeradas
     const context = sources
-      .map(
-        (s) =>
-          `Fonte ${s.rank} (id=${s.id}, similaridade=${Number(s.similarity).toFixed(3)}):\n` +
-          String(s.content ?? "").slice(0, 1200),
-      )
+      .map((s) => `Fonte ${s.rank}:\n${normalizeText(String(s.content ?? "")).slice(0, 1200)}`)
       .join("\n\n---\n\n");
 
+    // 5) Geração da resposta: explicitamente proíbe listar fontes/ids
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
@@ -102,15 +118,16 @@ serve(async (req) => {
           role: "system",
           content:
             "Você é um assistente que responde perguntas usando APENAS as fontes fornecidas. " +
-            "Se não houver informação suficiente nas fontes, diga claramente que não encontrou. " +
-            "Ao final da resposta, liste as fontes utilizadas no formato: Fontes: [id1, id2, ...].",
+            "Se não houver informação suficiente nas fontes, diga claramente que não encontrou nas notas. " +
+            "Responda em português, de forma objetiva, em 2 a 5 frases. " +
+            "NÃO inclua seção de fontes, IDs, UUIDs ou links no texto final.",
         },
         {
           role: "user",
           content:
             `Pergunta:\n${question}\n\n` +
-            `Fontes disponíveis:\n${context}\n\n` +
-            "Responda de forma objetiva e cite as fontes no final.",
+            `Fontes:\n${context}\n\n` +
+            "Responda somente com a resposta final, sem citar fontes/IDs.",
         },
       ],
     });
@@ -119,10 +136,16 @@ serve(async (req) => {
       completion.choices?.[0]?.message?.content?.trim() ??
       "Não foi possível gerar uma resposta.";
 
+    // 6) Resposta: fontes ficam estruturadas no JSON (pra UI), sem poluir texto
     return new Response(
       JSON.stringify({
         answer,
-        sources: sources.map((s) => ({ id: s.id, similarity: s.similarity })),
+        sources: sources.map((s) => ({
+          id: s.id,
+          similarity: s.similarity,
+          title: s.title,
+          preview: s.preview,
+        })),
       }),
       { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
