@@ -4,7 +4,7 @@ import OpenAI from "https://esm.sh/openai@4";
 
 // ===== ENV VARS =====
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY");
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
 
 function mustEnv(name: string, value: string | undefined): string {
@@ -24,16 +24,23 @@ function normalizeText(s: string) {
 }
 
 serve(async (req) => {
-  // ✅ Preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
   try {
-    // ✅ Só POST
     if (req.method !== "POST") {
       return new Response(JSON.stringify({ error: "Method not allowed" }), {
         status: 405,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+
+    // Exige Authorization
+    const authHeader = req.headers.get("Authorization") ?? "";
+    if (!authHeader.startsWith("Bearer ")) {
+      return new Response(JSON.stringify({ error: "Missing Authorization Bearer token" }), {
+        status: 401,
         headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
@@ -49,9 +56,17 @@ serve(async (req) => {
       );
     }
 
+    // Supabase client com ANON + JWT do usuário => RLS aplicado
     const supabase = createClient(
       mustEnv("SUPABASE_URL", SUPABASE_URL),
-      mustEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY),
+      mustEnv("SUPABASE_ANON_KEY", SUPABASE_ANON_KEY),
+      {
+        global: {
+          headers: {
+            Authorization: authHeader,
+          },
+        },
+      },
     );
 
     const openai = new OpenAI({
@@ -67,13 +82,19 @@ serve(async (req) => {
     const queryEmbedding = embeddingResponse.data?.[0]?.embedding;
     if (!queryEmbedding) throw new Error("Failed to generate embedding for the question");
 
-    // 2) Busca semântica
-    const { data: matches, error: matchError } = await supabase.rpc("match_documents", {
-      query_embedding: queryEmbedding,
-      match_count: topK,
-    });
+    // 2) Busca semântica (RPC segura por usuário)
+    // OBS: esta RPC deve filtrar por auth.uid() internamente
+    const { data: matches, error: matchError } = await supabase.rpc(
+      "match_documents_for_user",
+      {
+        query_embedding: queryEmbedding,
+        match_count: topK,
+      },
+    );
 
-    if (matchError) throw new Error(`match_documents RPC failed: ${matchError.message}`);
+    if (matchError) {
+      throw new Error(`match_documents_for_user RPC failed: ${matchError.message}`);
+    }
 
     if (!matches || matches.length === 0) {
       return new Response(
@@ -85,14 +106,15 @@ serve(async (req) => {
       );
     }
 
-    // 3) Monta fontes com dados úteis pro frontend (sem UUID na resposta do modelo)
+    // 3) Estrutura de fontes para UI (sem poluir resposta com UUID)
     const sources = matches.map((m: any, index: number) => {
       const raw = String(m.content ?? "");
       const clean = normalizeText(raw);
 
       const preview = clean.slice(0, 180);
-      const titleBase = clean.slice(0, 48);
-      const title = titleBase.length === 48 ? `${titleBase}…` : titleBase || `Nota ${index + 1}`;
+      const titleBase = clean.slice(0, 52);
+      const title =
+        titleBase.length === 52 ? `${titleBase}…` : titleBase || `Nota ${index + 1}`;
 
       return {
         rank: index + 1,
@@ -100,16 +122,16 @@ serve(async (req) => {
         similarity: m.similarity,
         title,
         preview,
-        content: raw, // mantém para montar contexto (não precisa mandar pro frontend)
+        content: raw,
       };
     });
 
-    // 4) Contexto para o modelo: sem IDs, sem UUID, só fontes numeradas
+    // 4) Contexto para o modelo (somente fontes numeradas, sem id)
     const context = sources
-      .map((s) => `Fonte ${s.rank}:\n${normalizeText(String(s.content ?? "")).slice(0, 1200)}`)
+      .map((s) => `Fonte ${s.rank}:\n${normalizeText(s.content).slice(0, 1200)}`)
       .join("\n\n---\n\n");
 
-    // 5) Geração da resposta: explicitamente proíbe listar fontes/ids
+    // 5) Resposta (sem UUIDs)
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
@@ -117,9 +139,9 @@ serve(async (req) => {
         {
           role: "system",
           content:
-            "Você é um assistente que responde perguntas usando APENAS as fontes fornecidas. " +
-            "Se não houver informação suficiente nas fontes, diga claramente que não encontrou nas notas. " +
-            "Responda em português, de forma objetiva, em 2 a 5 frases. " +
+            "Você é um assistente que responde usando APENAS as fontes fornecidas. " +
+            "Se não houver informação suficiente, diga claramente que não encontrou nas notas. " +
+            "Responda em português, de forma objetiva (2 a 6 frases). " +
             "NÃO inclua seção de fontes, IDs, UUIDs ou links no texto final.",
         },
         {
@@ -136,7 +158,6 @@ serve(async (req) => {
       completion.choices?.[0]?.message?.content?.trim() ??
       "Não foi possível gerar uma resposta.";
 
-    // 6) Resposta: fontes ficam estruturadas no JSON (pra UI), sem poluir texto
     return new Response(
       JSON.stringify({
         answer,
